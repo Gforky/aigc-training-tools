@@ -113,14 +113,14 @@ check_dependencies() {
 
     local found=0
 
-    if command -v numactl &>/dev/null; then
-        if numactl --show &>/dev/null; then
+    if command -v numactl 2>/dev/null; then
+        if numactl --show 2>/dev/null; then
             found=1
         fi
     fi
 
-    if command -v lscpu &>/dev/null; then
-        if lscpu -p &>/dev/null; then
+    if command -v lscpu 2>/dev/null; then
+        if lscpu -p 2>/dev/null; then
             found=1
         fi
     fi
@@ -151,7 +151,7 @@ get_numa_nodes() {
     local nodes=""
 
     # 尝试 numactl
-    if command -v numactl &>/dev/null; then
+    if command -v numactl 2>/dev/null; then
         nodes=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}' || true)
         if [[ -n "$nodes" ]]; then
             echo "$nodes"
@@ -160,7 +160,7 @@ get_numa_nodes() {
     fi
 
     # 尝试 lscpu -p (格式: thread,core,socket,node)
-    if command -v lscpu &>/dev/null; then
+    if command -v lscpu 2>/dev/null; then
         nodes=$(lscpu -p 2>/dev/null | grep -v "^#" | awk -F',' '{print $2}' | sort -u | tr '\n' ' ' || true)
         if [[ -n "$nodes" ]]; then
             echo "$nodes" | sed 's/ $//'
@@ -201,7 +201,7 @@ get_cpus_per_node() {
     local cpus=""
 
     # 尝试 numactl
-    if command -v numactl &>/dev/null; then
+    if command -v numactl 2>/dev/null; then
         cpus=$(numactl --hardware 2>/dev/null | grep "^node $target_node cpus:" | cut -d: -f2- | sed 's/^ *//' || true)
         if [[ -n "$cpus" ]]; then
             echo "$cpus"
@@ -210,7 +210,7 @@ get_cpus_per_node() {
     fi
 
     # 尝试 lscpu -p (格式: thread,core,socket,node)
-    if command -v lscpu &>/dev/null; then
+    if command -v lscpu 2>/dev/null; then
         cpus=$(lscpu -p 2>/dev/null | grep ",$target_node$" | awk -F',' '{print $2}' | sort -n | uniq | tr '\n' ' ' || true)
         if [[ -n "$cpus" ]]; then
             echo "$cpus" | sed 's/ $//'
@@ -236,7 +236,7 @@ gpu_to_numa_node() {
     local gpu_id=$1
 
     # 方法1: nvidia-smi --query-gpu 获取 PCI 总线，然后用 sysfs
-    if command -v nvidia-smi &>/dev/null; then
+    if command -v nvidia-smi 2>/dev/null; then
         # 获取 PCI 总线 ID（如 0000:17:00.0）
         local pci_bus
         pci_bus=$(nvidia-smi --query-gpu=pci.bus_id --id="$gpu_id" --format=csv,noheader 2>/dev/null | head -1 | sed 's/00000000://' | tr '[:upper:]' '[:lower:]' || true)
@@ -325,20 +325,20 @@ show_numa_topology() {
     echo ""
 
     # lscpu 输出
-    if command -v lscpu &>/dev/null; then
+    if command -v lscpu 2>/dev/null; then
         echo "--- lscpu ---"
         lscpu 2>/dev/null | grep -E "Architecture|Socket|Core|Thread|NUMA|CPU\(s\)|^#" || true
         echo ""
     fi
 
     # numactl 输出
-    if command -v numactl &>/dev/null; then
-        if numactl --show &>/dev/null; then
+    if command -v numactl 2>/dev/null; then
+        if numactl --show 2>/dev/null; then
             echo "--- numactl --show ---"
             numactl --show 2>/dev/null
             echo ""
         fi
-        if numactl --hardware &>/dev/null; then
+        if numactl --hardware 2>/dev/null; then
             echo "--- numactl --hardware ---"
             numactl --hardware 2>/dev/null
             echo ""
@@ -361,7 +361,7 @@ show_numa_topology() {
     fi
 
     # GPU 信息
-    if command -v nvidia-smi &>/dev/null; then
+    if command -v nvidia-smi 2>/dev/null; then
         echo "--- NVIDIA GPU ---"
         nvidia-smi -L 2>/dev/null || log_warn "nvidia-smi 可用但无法列出 GPU"
         echo ""
