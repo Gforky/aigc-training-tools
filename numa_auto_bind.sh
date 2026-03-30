@@ -56,8 +56,8 @@ ${YELLOW}选项:${NC}
                       例: --gpus 0,1,2,3 或 --gpus 0,1
 
     --mode <mode>     绑定模式:
-                      full    - 所有 CPU 绑定到各自 NUMA 节点（宽松模式）
-                      strict  - 每个 NUMA 节点严格绑定自身 CPU
+                      full    - 跨所有 NUMA 节点交织分配内存，不绑 CPU
+                      strict  - 严格绑定到第一个 NUMA 节点的 CPU 和内存
                       manual  - 手动指定 CPU 范围和节点（需配合 --cpus --node）
 
     --cpus <range>    手动指定的 CPU 范围（配合 --mode manual）
@@ -82,6 +82,12 @@ ${YELLOW}示例:${NC}
 
     # 显示 NUMA 拓扑
     $0 --show
+
+    # 严格绑定第一个 NUMA 节点（适合单节点训练）
+    $0 --mode strict
+
+    # 跨所有节点交织分配（适合多节点分布式训练）
+    $0 --mode full
 
     # 手动绑定 CPU 0-31 到节点 0
     $0 --mode manual --cpus 0-31 --node 0
@@ -418,33 +424,26 @@ generate_bind_command() {
 
     case "$mode" in
         full)
-            log_info "模式: full（所有 CPU 绑定到各自 NUMA 节点）"
+            log_info "模式: full（跨所有 NUMA 节点交织分配，不限制 CPU）"
             target_node="all"
-            local all_cpus=""
-            for node in $(get_numa_nodes || echo ""); do
-                [[ -z "$node" ]] && continue
-                local node_cpus
-                node_cpus=$(get_cpus_per_node "$node" || true)
-                if [[ -n "$node_cpus" ]]; then
-                    all_cpus="$all_cpus $node_cpus"
-                fi
-            done
-            target_cpus=$(echo "$all_cpus" | tr ' ' '\n' | grep -v '^$' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            # full 模式: 内存交织分配到所有节点，不绑 CPU，让 OS 自行调度
+            bind_args="--interleave=all"
             ;;
 
         strict)
-            log_info "模式: strict（每个节点严格绑定自身 CPU）"
-            target_node="all"
-            local all_cpus=""
-            for node in $(get_numa_nodes || echo ""); do
-                [[ -z "$node" ]] && continue
-                local node_cpus
-                node_cpus=$(get_cpus_per_node "$node" || true)
-                if [[ -n "$node_cpus" ]]; then
-                    all_cpus="$all_cpus $node_cpus"
-                fi
-            done
-            target_cpus=$(echo "$all_cpus" | tr ' ' '\n' | grep -v '^$' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            log_info "模式: strict（严格绑定到第一个 NUMA 节点）"
+            # strict 模式: 选择第一个有 CPU 的节点，严格绑定 CPU 和内存
+            local first_node
+            first_node=$(get_numa_nodes | awk '{print $1}' || echo "0")
+            local node_cpus
+            node_cpus=$(get_cpus_per_node "$first_node" || true)
+            if [[ -z "$node_cpus" ]]; then
+                log_err "无法获取节点 $first_node 的 CPU 信息"
+                exit 1
+            fi
+            target_node="$first_node"
+            target_cpus="$node_cpus"
+            bind_args="--cpunodebind=$first_node --membind=$first_node"
             ;;
 
         gpu)
@@ -510,24 +509,37 @@ generate_bind_command() {
 
     local node_display
     node_display=$(echo "$target_node" | tr '\n' ',' | sed 's/,$//')
-    local cpu_count
-    cpu_count=$(echo "$target_cpus" | tr ',' '\n' | wc -l)
 
-    echo "${GREEN}绑定的 NUMA 节点:${NC} $node_display"
-    echo "${GREEN}绑定的 CPU 数量:${NC} $cpu_count"
-    echo "${GREEN}CPU 列表:${NC} $target_cpus"
-    echo ""
-
-    echo "${GREEN}可 source 的环境变量:${NC}"
-    echo "  export NUMA_CPUS=\"$target_cpus\""
-    echo "  export NUMA_NODE=\"$target_node\""
-    echo "  export NUMA_GPUS=\"$gpu_ids\""
-    echo ""
-
-    if [[ "$mode" == "gpu" || "$mode" == "manual" ]]; then
-        bind_args="--physcpubind=$target_cpus --membind=$target_node"
+    if [[ "$mode" == "full" ]]; then
+        echo "${GREEN}绑定模式:${NC} 跨所有节点交织分配（不绑 CPU）"
+        echo "${GREEN}交织节点:${NC} $node_display"
+        echo ""
+        echo "${GREEN}可 source 的环境变量:${NC}"
+        echo "  export NUMA_NODE=\"$target_node\""
+        echo "  export NUMA_GPUS=\"$gpu_ids\""
+        echo ""
     else
-        bind_args="--cpunodebind=$target_node --membind=$target_node"
+        local cpu_count
+        cpu_count=$(echo "$target_cpus" | tr ',' '\n' | wc -l)
+        echo "${GREEN}绑定的 NUMA 节点:${NC} $node_display"
+        echo "${GREEN}绑定的 CPU 数量:${NC} $cpu_count"
+        echo "${GREEN}CPU 列表:${NC} $target_cpus"
+        echo ""
+        echo "${GREEN}可 source 的环境变量:${NC}"
+        echo "  export NUMA_CPUS=\"$target_cpus\""
+        echo "  export NUMA_NODE=\"$target_node\""
+        echo "  export NUMA_GPUS=\"$gpu_ids\""
+        echo ""
+    fi
+
+    if [[ "$mode" == "full" ]]; then
+        # full 模式已在上面设置 bind_args="--interleave=all"
+        :
+    elif [[ "$mode" == "strict" ]]; then
+        # strict 模式已在上面设置 bind_args="--cpunodebind=X --membind=X"
+        :
+    elif [[ "$mode" == "gpu" || "$mode" == "manual" ]]; then
+        bind_args="--physcpubind=$target_cpus --membind=$target_node"
     fi
 
     echo "${GREEN}推荐启动命令:${NC}"
@@ -543,7 +555,23 @@ generate_bind_command() {
     fi
 
     local env_file="/tmp/numa_env_$(whoami 2>/dev/null || echo 'default').sh"
-    cat > "$env_file" << EOF
+    if [[ "$mode" == "full" ]]; then
+        cat > "$env_file" << EOF
+# NUMA Auto-Bind 环境变量
+# 生成时间: $(date)
+# 模式: $mode (跨所有节点交织分配)
+
+export NUMA_NODE="$target_node"
+export NUMA_GPUS="$gpu_ids"
+
+export LAUNCH_CMD="numactl $bind_args"
+
+# 使用方式:
+#   source $env_file
+#   \$LAUNCH_CMD python train.py
+EOF
+    else
+        cat > "$env_file" << EOF
 # NUMA Auto-Bind 环境变量
 # 生成时间: $(date)
 # 模式: $mode
@@ -558,6 +586,7 @@ export LAUNCH_CMD="numactl $bind_args"
 #   source $env_file
 #   \$LAUNCH_CMD python train.py
 EOF
+    fi
 
     log_info "环境变量已保存到: $env_file"
     echo ""
