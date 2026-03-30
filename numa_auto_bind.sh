@@ -235,35 +235,79 @@ get_cpus_per_node() {
 gpu_to_numa_node() {
     local gpu_id=$1
 
-    # 尝试 nvidia-smi + PCI 总线
+    # 方法1: nvidia-smi --query-gpu 获取 PCI 总线，然后用 sysfs
     if command -v nvidia-smi &>/dev/null; then
+        # 获取 PCI 总线 ID（如 0000:17:00.0）
         local pci_bus
-        pci_bus=$(nvidia-smi -i "$gpu_id" -q 2>/dev/null | grep -i "Bus Id" | grep -oP '0000:\K[0-9a-fA-F]+\.[0-9a-fA-F]+' | head -1 || true)
+        pci_bus=$(nvidia-smi --query-gpu=pci.bus_id --id="$gpu_id" --format=csv,noheader 2>/dev/null | head -1 | sed 's/0000://' || true)
         if [[ -n "$pci_bus" ]]; then
+            # 尝试读取 sysfs numa_node
             local sys_path="/sys/bus/pci/devices/0000:$pci_bus/numa_node"
             if [[ -f "$sys_path" ]]; then
                 local node
                 node=$(cat "$sys_path" 2>/dev/null || true)
-                if [[ -n "$node" && "$node" != "-1" ]]; then
-                    [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> PCI $pci_bus -> NUMA $node"
+                if [[ -n "$node" && "$node" != "-1" && "$node" != "" ]]; then
+                    [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> PCI 0000:$pci_bus -> NUMA $node"
                     echo "$node"
                     return 0
                 fi
             fi
         fi
 
-        # 方法2: 直接从 nvidia-smi 解析（较新版本）
+        # 方法2: 直接从 nvidia-smi XML 输出解析（某些驱动版本）
         local numa
-        numa=$(nvidia-smi -i "$gpu_id" -q 2>/dev/null | grep -i "numa id" | grep -oP '\d+' | head -1 || true)
+        numa=$(nvidia-smi -i "$gpu_id" -q -x 2>/dev/null | grep -oP 'numa_node.*?\K\d+' | head -1 || true)
         if [[ -n "$numa" ]]; then
-            [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> NUMA $numa (from nvidia-smi)"
+            [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> NUMA $numa (from nvidia-smi XML)"
             echo "$numa"
             return 0
         fi
+
+        # 方法3: 从 nvidia-smi text 输出解析（Bus Location 字段）
+        local bus_location
+        bus_location=$(nvidia-smi -i "$gpu_id" -q 2>/dev/null | grep -i "Bus Location" | grep -oP '\K[0-9a-fA-F]+' | head -1 || true)
+        if [[ -n "$bus_location" ]]; then
+            # 通常 GPU 的 PCI bus ID 和 Bus Location 格式相同
+            local sys_path
+            for sys_dev in /sys/bus/pci/devices/*:"$bus_location"*; do
+                if [[ -f "$sys_dev/numa_node" ]]; then
+                    node=$(cat "$sys_dev/numa_node" 2>/dev/null || true)
+                    if [[ -n "$node" && "$node" != "-1" ]]; then
+                        [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> $sys_dev -> NUMA $node"
+                        echo "$node"
+                        return 0
+                    fi
+                fi
+            done
+        fi
+
+        # 方法4: 尝试 lspci 匹配
+        local lspci_output
+        lspci_output=$(lspci 2>/dev/null | grep -i "vga\|3d\|nvidia" | head -"$(($gpu_id + 1))" | tail -1 || true)
+        if [[ -n "$lspci_output" ]]; then
+            local slot
+            slot=$(echo "$lspci_output" | awk '{print $1}' || true)
+            if [[ -n "$slot" && -f "/sys/bus/pci/devices/$slot/numa_node" ]]; then
+                node=$(cat "/sys/bus/pci/devices/$slot/numa_node" 2>/dev/null || true)
+                if [[ -n "$node" && "$node" != "-1" ]]; then
+                    [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> lspci $slot -> NUMA $node"
+                    echo "$node"
+                    return 0
+                fi
+            fi
+        fi
     fi
 
-    log_warn "无法确定 GPU $gpu_id 的 NUMA 节点，使用启发式分配（默认节点 0）"
-    echo "0"
+    # 回退：启发式分配
+    # 根据 GPU 总数和 NUMA 节点数做更合理的分配
+    local gpu_count=${GPU_IDS:-1}
+    local node_count
+    node_count=$(get_numa_nodes 2>/dev/null | wc -w || echo "1")
+    local node
+    node=$((gpu_id % node_count))
+
+    log_warn "无法确定 GPU $gpu_id 的 NUMA 节点，使用启发式分配（NUMA Node $node，基于 GPU $gpu_id % $node_count nodes）"
+    echo "$node"
 }
 
 #==============================================================================
