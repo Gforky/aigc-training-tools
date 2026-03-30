@@ -239,7 +239,7 @@ gpu_to_numa_node() {
     if command -v nvidia-smi &>/dev/null; then
         # 获取 PCI 总线 ID（如 0000:17:00.0）
         local pci_bus
-        pci_bus=$(nvidia-smi --query-gpu=pci.bus_id --id="$gpu_id" --format=csv,noheader 2>/dev/null | head -1 | sed 's/^0000:/00000000:/' | tr '[:upper:]' '[:lower:]' || true)
+        pci_bus=$(nvidia-smi --query-gpu=pci.bus_id --id="$gpu_id" --format=csv,noheader 2>/dev/null | head -1 | sed 's/00000000://' | tr '[:upper:]' '[:lower:]' || true)
         if [[ -n "$pci_bus" ]]; then
             # 尝试读取 sysfs numa_node
             local sys_path="/sys/bus/pci/devices/0000:$pci_bus/numa_node"
