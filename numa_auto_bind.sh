@@ -8,10 +8,11 @@
 #   ./numa_auto_bind.sh --mode full              所有 CPU 绑定到各自 NUMA 节点
 #   ./numa_auto_bind.sh --mode manual --cpus 0-31 --node 0
 #   ./numa_auto_bind.sh --show                    显示当前 NUMA 拓扑
+#   ./numa_auto_bind.sh --force                   强制运行（跳过依赖检查）
 #   ./numa_auto_bind.sh --help
 #
 # 作者: Zero (AI Assistant)
-# 需求: numactl, lscpu, /proc/cpuinfo
+# 需求: numactl 或 lscpu（至少有一个）
 #==============================================================================
 
 set -euo pipefail
@@ -28,6 +29,7 @@ GPU_IDS=""
 MANUAL_CPUS=""
 MANUAL_NODE=""
 VERBOSE=0
+FORCE=0
 
 #==============================================================================
 # 辅助函数
@@ -38,7 +40,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_err()   { echo -e "${RED}[ERR ]${NC} $1" >&2; }
 
 version() {
-    echo "numa_auto_bind.sh v1.0.0"
+    echo "numa_auto_bind.sh v1.1.0"
 }
 
 usage() {
@@ -63,6 +65,8 @@ ${YELLOW}选项:${NC}
     --node <n>        手动指定的 NUMA 节点编号（配合 --mode manual）
 
     --show            显示当前 NUMA 拓扑信息
+
+    --force           强制运行，跳过依赖检查（使用 /proc 或 /sys 读取 NUMA 信息）
 
     --verbose         显示详细调试信息
 
@@ -102,73 +106,225 @@ EOF
 # 检查依赖
 #==============================================================================
 check_dependencies() {
+    if [[ "$FORCE" == "1" ]]; then
+        return 0
+    fi
+
     local missing=()
+    local found=0
 
-    if ! command -v numactl &>/dev/null; then
-        missing+=("numactl (apt install numactl / yum install numactl)")
+    if command -v numactl &>/dev/null; then
+        # 测试 numactl 是否真正可用（可能安装了但无权限）
+        if numactl --show &>/dev/null; then
+            found=1
+        fi
     fi
 
-    if ! command -v lscpu &>/dev/null; then
-        missing+=("lscpu (apt install util-linux / yum install util-linux)")
+    if command -v lscpu &>/dev/null; then
+        if lscpu --parseable &>/dev/null || lscpu -p &>/dev/null; then
+            found=1
+        fi
     fi
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_err "缺少必要依赖:"
-        for dep in "${missing[@]}"; do
-            echo "  - $dep"
-        done
+    # 检查 /sys 文件系统（最基础的 NUMA 检测）
+    if [[ -d /sys/devices/system/node ]]; then
+        found=1
+    fi
+
+    if [[ "$found" == "0" ]]; then
+        missing+=("numactl (apt install numactl)")
+        missing+=("lscpu (apt install util-linux)")
+        missing+=("/sys/devices/system/node (NUMA sysfs)")
+
+        log_err "缺少 NUMA 支持，请安装上述依赖之一，或使用 --force 强制运行"
+        log_info "提示: 使用 --force 会尝试从 /sys 读取 NUMA 信息"
         exit 1
     fi
+
+    [[ "$VERBOSE" == "1" ]] && log_info "NUMA 信息源检测正常"
 }
 
 #==============================================================================
-# 获取 NUMA 拓扑信息
+# 获取 NUMA 信息（多层 fallback）
 #==============================================================================
-get_numa_info() {
+
+# 方法1: numactl --hardware
+get_numa_info_numactl() {
     numactl --hardware 2>/dev/null || numactl -H 2>/dev/null
 }
 
+# 方法2: lscpu
+get_numa_info_lscpu() {
+    lscpu 2>/dev/null
+}
+
+# 方法3: 从 /sys 读取
+get_numa_info_sys() {
+    local node_path="/sys/devices/system/node"
+    if [[ ! -d "$node_path" ]]; then
+        return 1
+    fi
+
+    echo "NUMA topology from /sys:"
+    for node_dir in "$node_path"/node*; do
+        if [[ -d "$node_dir" ]]; then
+            local node_name
+            node_name=$(basename "$node_dir")
+            local cpu_list
+            cpu_list=$(cat "$node_dir"/cpumap 2>/dev/null | tr -d '\n' || echo "unknown")
+            # cpumap 是 bitmask，需要转换
+            local cpu_count
+            cpu_count=$(ls -d "$node_dir"/cpu[0-9]* 2>/dev/null | wc -l || echo "?")
+            echo "$node_name: cpus=$cpu_count (cpumap=$cpu_list)"
+        fi
+    done
+}
+
+# 获取所有 NUMA 节点列表
 get_numa_nodes() {
-    numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}'
+    local nodes=""
+
+    # 尝试 numactl
+    if command -v numactl &>/dev/null; then
+        nodes=$(numactl --hardware 2>/dev/null | grep "available:" | awk '{print $2}')
+        if [[ -n "$nodes" ]]; then
+            echo "$nodes"
+            return 0
+        fi
+    fi
+
+    # 尝试 lscpu -p
+    if command -v lscpu &>/dev/null; then
+        nodes=$(lscpu -p 2>/dev/null | grep -v "^#" | awk -F',' '{print $2}' | sort -u | tr '\n' ' ')
+        if [[ -n "$nodes" ]]; then
+            echo "$nodes" | sed 's/ $//'
+            return 0
+        fi
+    fi
+
+    # 尝试 /sys
+    for node_dir in /sys/devices/system/node/node*; do
+        if [[ -d "$node_dir" ]]; then
+            local node_id
+            node_id=$(basename "$node_dir" | sed 's/node//')
+            nodes="$nodes $node_id"
+        fi
+    done
+
+    if [[ -n "$nodes" ]]; then
+        echo "$nodes" | sed 's/^ //' | tr ' ' '\n' | sort -n | tr '\n' ' ' | sed 's/ $//'
+        return 0
+    fi
+
+    return 1
 }
 
+# 获取指定 NUMA 节点的 CPU 列表（核心编号）
 get_cpus_per_node() {
-    local node=$1
-    numactl --hardware 2>/dev/null | grep "node $node cpus:" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i}'
+    local target_node=$1
+    local cpus=""
+
+    # 尝试 numactl
+    if command -v numactl &>/dev/null; then
+        cpus=$(numactl --hardware 2>/dev/null | grep "^node $target_node cpus:" | cut -d: -f2- | sed 's/^ *//')
+        if [[ -n "$cpus" ]]; then
+            echo "$cpus"
+            return 0
+        fi
+    fi
+
+    # 尝试 lscpu -p（格式: thread,core,socket,node）
+    if command -v lscpu &>/dev/null; then
+        cpus=$(lscpu -p 2>/dev/null | grep ",$target_node$" | awk -F',' '{print $2}' | sort -n | uniq | tr '\n' ' ' | sed 's/ $//')
+        if [[ -n "$cpus" ]]; then
+            echo "$cpus"
+            return 0
+        fi
+    fi
+
+    # 尝试 /sys
+    local node_path="/sys/devices/system/node/node$target_node"
+    if [[ -d "$node_path" ]]; then
+        # 读取 cpu list (有些系统有 cpulist 文件)
+        if [[ -f "$node_path/cpulist" ]]; then
+            cat "$node_path/cpulist" 2>/dev/null && return 0
+        fi
+        # 从 cpumap bitmask 转换
+        if [[ -f "$node_path/cpumap" ]]; then
+            local bitmask
+            bitmask=$(cat "$node_path/cpumap" 2>/dev/null | tr -d '\n ')
+            # 解析 bitmask 为 CPU 列表
+            local cpu_idx=0
+            local cpu_list=""
+            for byte in $(echo "$bitmask" | fold -w2); do
+                local val=$((16#$byte))
+                local bit=0
+                while [[ $bit -lt 8 ]]; do
+                    if (( (val >> bit) & 1 )); then
+                        cpu_list="$cpu_list $cpu_idx"
+                    fi
+                    ((bit++))
+                done
+                ((cpu_idx+=8))
+            done
+            echo "$cpu_list" | sed 's/^ //' | tr ' ' '\n' | sort -n | uniq | tr '\n' ' ' | sed 's/ $//'
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
-get_phys_cpu_list() {
-    local node=$1
-    # 获取节点的 CPU 列表（物理核心）
-    numactl --physcpubind=$node 2>/dev/null || \
-        lscpu -p | grep ",$node," | awk -F',' '{print $2}' | sort -n | uniq
+# 获取 CPU 总数和节点数
+get_system_info() {
+    local cpu_count
+    local node_count
+
+    cpu_count=$(nproc 2>/dev/null || grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "?")
+    node_count=$(echo "$(get_numa_nodes)" | wc -w 2>/dev/null || echo "?")
+
+    echo "CPU 总数: $cpu_count"
+    echo "NUMA 节点数: $node_count"
 }
 
 #==============================================================================
-# 根据 GPU ID 推断 NUMA 节点（通过 PCI 总线位置）
+# 根据 GPU ID 推断 NUMA 节点
 #==============================================================================
 gpu_to_numa_node() {
     local gpu_id=$1
 
-    # 尝试通过 nvidia-smi 获取 GPU PCI 总线信息
+    # 尝试 nvidia-smi + PCI 总线
     if command -v nvidia-smi &>/dev/null; then
+        # 方法1: 通过 nvidia-smi 查询 PCI 总线，然后查 sysfs
         local pci_bus
-        pci_bus=$(nvidia-smi -i "$gpu_id" -q -x 2>/dev/null | \
-                   grep -oP 'BusLocation.*?\K([0-9a-fA-F]+)' | head -1)
-
+        pci_bus=$(nvidia-smi -i "$gpu_id" -q 2>/dev/null | grep -i "Bus Id" | grep -oP '0000:\K[0-9a-fA-F]+\.[0-9a-fA-F]+' | head -1)
         if [[ -n "$pci_bus" ]]; then
-            # 读取 NUMA 节点（从 /sys 或 lspci）
             local sys_path="/sys/bus/pci/devices/0000:$pci_bus/numa_node"
             if [[ -f "$sys_path" ]]; then
-                cat "$sys_path" 2>/dev/null
-                return
+                local node
+                node=$(cat "$sys_path" 2>/dev/null)
+                if [[ -n "$node" && "$node" != "-1" ]]; then
+                    [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> PCI $pci_bus -> NUMA $node"
+                    echo "$node"
+                    return 0
+                fi
             fi
+        fi
+
+        # 方法2: 直接从 nvidia-smi 解析（较新版本）
+        local numa
+        numa=$(nvidia-smi -i "$gpu_id" -q 2>/dev/null | grep -i "numa id" | grep -oP '\d+' | head -1)
+        if [[ -n "$numa" ]]; then
+            [[ "$VERBOSE" == "1" ]] && log_info "GPU $gpu_id -> NUMA $numa (from nvidia-smi)"
+            echo "$numa"
+            return 0
         fi
     fi
 
-    # 回退方案：通过 GPU 数量猜测（同节点 = 前半部分 GPU）
-    # 注意：这是启发式方法，不保证准确
-    echo "0"  # 默认返回节点 0
+    # 回退: 通过 GPU 数量启发式分配（同节点 = 前半 GPU）
+    # 仅当没有其他信息时使用
+    log_warn "无法确定 GPU $gpu_id 的 NUMA 节点，使用启发式分配"
+    echo "0"
 }
 
 #==============================================================================
@@ -177,42 +333,88 @@ gpu_to_numa_node() {
 show_numa_topology() {
     log_info "===== NUMA 拓扑信息 ====="
 
-    if command -v lscpu &>/dev/null; then
-        echo ""
-        lscpu | grep -E "Architecture|Socket|Core|Thread|NUMA|CPU\(s\)"
-        echo ""
+    local os
+    os=$(uname -s)
+    if [[ "$os" != "Linux" ]]; then
+        log_warn "检测到操作系统: $os，NUMA 主要为 Linux 设计"
     fi
 
     echo ""
-    log_info "NUMA 节点详情:"
-    numactl --hardware 2>/dev/null
 
-    echo ""
-    log_info "CPU 分布:"
+    # 尝试 lscpu（格式最好）
+    if command -v lscpu &>/dev/null; then
+        echo "--- lscpu 输出 ---"
+        lscpu 2>/dev/null | grep -E "Architecture|Socket|Core|Thread|NUMA|CPU\(s\)|^#"
+        echo ""
+    fi
+
+    # 尝试 numactl
+    if command -v numactl &>/dev/null; then
+        if numactl --show &>/dev/null; then
+            echo "--- numactl --show ---"
+            numactl --show 2>/dev/null
+            echo ""
+        fi
+        if numactl --hardware &>/dev/null; then
+            echo "--- numactl --hardware ---"
+            numactl --hardware 2>/dev/null
+            echo ""
+        fi
+    fi
+
+    # /sys 方式
+    if [[ -d /sys/devices/system/node ]]; then
+        echo "--- /sys/devices/system/node ---"
+        for node_dir in /sys/devices/system/node/node*; do
+            if [[ -d "$node_dir" ]]; then
+                local node_name
+                node_name=$(basename "$node_dir")
+                local cpulist
+                cpulist=$(cat "$node_dir/cpulist" 2>/dev/null || echo "N/A")
+                local meminfo
+                meminfo=$(cat "$node_dir/meminfo" 2>/dev/null | head -2 || echo "N/A")
+                echo "$node_name: cpulist=$cpulist"
+                echo "  $meminfo"
+            fi
+        done
+        echo ""
+    fi
+
+    # GPU 信息
+    if command -v nvidia-smi &>/dev/null; then
+        echo "--- NVIDIA GPU ---"
+        nvidia-smi -L 2>/dev/null || true
+        echo ""
+        echo "GPU -> NUMA 映射:"
+        local gpu_count
+        gpu_count=$(nvidia-smi --list-gpus 2>/dev/null | grep -c "GPU" || echo "0")
+        for ((i=0; i<gpu_count; i++)); do
+            local node
+            node=$(gpu_to_numa_node "$i")
+            echo "  GPU $i -> NUMA Node $node"
+        done
+        echo ""
+    fi
+
+    # CPU 分布表
+    log_info "CPU 分布详情:"
     local nodes
     nodes=$(get_numa_nodes)
-    for node in $nodes; do
-        local cpus
-        cpus=$(get_phys_cpu_list $node)
-        log_info "  节点 $node: $cpus"
-    done
-
-    echo ""
-    log_info "内存分布:"
-    numactl -s 2>/dev/null | grep -E "node|size" || numactl --show
-
-    # 检查 NVIDIA GPU 和 NUMA 关联
-    if command -v nvidia-smi &>/dev/null; then
-        echo ""
-        log_info "GPU-NUMA 映射:"
-        nvidia-smi -L 2>/dev/null || true
-        for gpu in $(nvidia-smi --list-gpus 2>/dev/null | grep "GPU [0-9]" | grep -oP 'GPU [0-9]'); do
-            local gpu_id
-            gpu_id=$(echo "$gpu" | grep -oP '[0-9]+')
-            local numa_node
-            numa_node=$(gpu_to_numa_node "$gpu_id")
-            echo "  GPU $gpu_id -> NUMA Node $numa_node"
+    if [[ -n "$nodes" ]]; then
+        for node in $nodes; do
+            local cpus
+            cpus=$(get_cpus_per_node "$node")
+            if [[ -n "$cpus" ]]; then
+                local cpu_count
+                cpu_count=$(echo "$cpus" | wc -w)
+                log_info "  节点 $node: $cpu_count 个 CPU核心"
+                if [[ "$VERBOSE" == "1" ]]; then
+                    log_info "    $cpus"
+                fi
+            fi
         done
+    else
+        log_warn "无法获取 CPU 分布信息"
     fi
 
     echo ""
@@ -223,68 +425,91 @@ show_numa_topology() {
 #==============================================================================
 generate_bind_command() {
     local mode=$1
-    shift
-    local gpu_ids=$1
-    shift
-    local manual_cpus=$1
-    shift
-    local manual_node=$1
+    local gpu_ids=$2
+    local manual_cpus=$3
+    local manual_node=$4
 
     local target_cpus=""
     local target_node=""
     local gpu_numa_nodes=()
+    local bind_args=""
 
     case "$mode" in
-        full|strict)
-            log_info "使用 --mode $mode"
-            # 获取所有 NUMA 节点上的 CPU
+        full)
+            log_info "模式: full（所有 CPU 绑定到各自 NUMA 节点）"
+            target_node="all"
+            # 收集所有节点的 CPU
             local all_cpus=""
             for node in $(get_numa_nodes); do
                 local node_cpus
-                node_cpus=$(get_phys_cpu_list $node)
-                all_cpus="$all_cpus $node_cpus"
+                node_cpus=$(get_cpus_per_node "$node")
+                if [[ -n "$node_cpus" ]]; then
+                    all_cpus="$all_cpus $node_cpus"
+                fi
             done
-            target_cpus=$(echo "$all_cpus" | tr ' ' '\n' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            # 去重并排序
+            target_cpus=$(echo "$all_cpus" | tr ' ' '\n' | grep -v '^$' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            ;;
+
+        strict)
+            log_info "模式: strict（每个节点严格绑定自身 CPU）"
             target_node="all"
+            # strict 模式: 每个节点分别绑定
+            local all_cpus=""
+            for node in $(get_numa_nodes); do
+                local node_cpus
+                node_cpus=$(get_cpus_per_node "$node")
+                if [[ -n "$node_cpus" ]]; then
+                    all_cpus="$all_cpus $node_cpus"
+                fi
+            done
+            target_cpus=$(echo "$all_cpus" | tr ' ' '\n' | grep -v '^$' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
             ;;
 
         gpu)
-            log_info "GPU 模式: $gpu_ids"
-            # 收集所有 GPU 对应的 NUMA 节点
-            local node_cpu_map=()  # associative-like array: node -> cpus
+            log_info "GPU 模式: 绑定 GPU [$gpu_ids] 对应的 NUMA 节点 CPU"
+
+            # 去重收集每个 GPU 对应的 NUMA 节点
             declare -A node_cpus
+            local unique_nodes=()
 
             IFS=',' read -ra GPU_ARRAY <<< "$gpu_ids"
             for gpu in "${GPU_ARRAY[@]}"; do
                 gpu=$(echo "$gpu" | tr -d ' ')
+                [[ -z "$gpu" ]] && continue
+
                 local numa_node
                 numa_node=$(gpu_to_numa_node "$gpu")
                 gpu_numa_nodes+=("$gpu:$numa_node")
 
-                local node_cpus_list
-                node_cpus_list=$(get_phys_cpu_list "$numa_node")
-
-                if [[ -z "${node_cpus[$numa_node]:-}" ]]; then
-                    node_cpus[$numa_node]="$node_cpus_list"
+                # 避免重复收集同一节点
+                if [[ ! " ${unique_nodes[*]} " =~ " ${numa_node} " ]]; then
+                    unique_nodes+=("$numa_node")
+                    local node_cpu_list
+                    node_cpu_list=$(get_cpus_per_node "$numa_node")
+                    if [[ -n "$node_cpu_list" ]]; then
+                        node_cpus[$numa_node]="$node_cpu_list"
+                    fi
                 fi
             done
 
-            # 合并同一节点的 CPU
-            local first_node=""
-            target_cpus=""
-            for node in $(echo "${!node_cpus[@]}" | tr ' ' '\n' | sort -n); do
-                [[ -z "$first_node" ]] && first_node=$node
-                target_cpus="$target_cpus $(echo "${node_cpus[$node]}" | tr ' ' '\n' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')"
+            if [[ ${#node_cpus[@]} -eq 0 ]]; then
+                log_err "无法获取 NUMA 节点 CPU 信息，请检查 numactl 或 /sys 是否可用"
+                log_info "可尝试 --force 参数强制运行"
+                exit 1
+            fi
+
+            # 合并所有节点的 CPU
+            local combined_cpus=""
+            for node in "${!node_cpus[@]}"; do
+                combined_cpus="$combined_cpus ${node_cpus[$node]}"
             done
-            target_cpus=$(echo "$target_cpus" | tr ' ' '\n' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
-            target_node=$first_node
+            target_cpus=$(echo "$combined_cpus" | tr ' ' '\n' | grep -v '^$' | sort -n | uniq | tr '\n' ',' | sed 's/,$//')
+            target_node=$(IFS=,; echo "${unique_nodes[*]}")
             ;;
 
         manual)
-            if [[ -z "$manual_cpus" || -z "$manual_node" ]]; then
-                log_err "--mode manual 需要配合 --cpus 和 --node 参数"
-                exit 1
-            fi
+            log_info "手动模式: CPU [$manual_cpus] -> NUMA Node $manual_node"
             target_cpus="$manual_cpus"
             target_node="$manual_node"
             ;;
@@ -295,34 +520,58 @@ generate_bind_command() {
             ;;
     esac
 
+    if [[ -z "$target_cpus" ]]; then
+        log_err "未能获取任何 CPU 信息，绑定失败"
+        log_info "请确认: (1) numactl 已安装且可用, (2) /sys/devices/system/node 存在"
+        log_info "或使用 --force 强制运行"
+        exit 1
+    fi
+
     # 输出结果
     echo ""
     log_ok "===== 绑定配置结果 ====="
     echo ""
-    echo "export NUMA_CPUS=\"$target_cpus\""
-    echo "export NUMA_NODE=\"$target_node\""
-    echo "export NUMA_GPUS=\"$gpu_ids\""
+
+    # 如果节点是多个，用逗号分隔显示
+    local node_display
+    node_display=$(echo "$target_node" | tr '\n' ',' | sed 's/,$//')
+    local cpu_count
+    cpu_count=$(echo "$target_cpus" | tr ',' '\n' | wc -l)
+
+    echo "${GREEN}绑定的 NUMA 节点:${NC} $node_display"
+    echo "${GREEN}绑定的 CPU 数量:${NC} $cpu_count"
+    echo "${GREEN}CPU 列表:${NC} $target_cpus"
     echo ""
 
-    # 生成推荐命令
-    local bind_args=""
-    if [[ "$mode" == "gpu" ]]; then
+    # 生成环境变量
+    echo "${GREEN}可 source 的环境变量:${NC}"
+    echo "  export NUMA_CPUS=\"$target_cpus\""
+    echo "  export NUMA_NODE=\"$target_node\""
+    echo "  export NUMA_GPUS=\"$gpu_ids\""
+    echo ""
+
+    # 生成绑定参数
+    if [[ "$mode" == "gpu" || "$mode" == "manual" ]]; then
         bind_args="--physcpubind=$target_cpus --membind=$target_node"
     else
         bind_args="--cpunodebind=$target_node --membind=$target_node"
     fi
 
-    echo "export LAUNCH_CMD=\"numactl $bind_args\""
-    echo ""
-    echo "${GREEN}快速使用:${NC}"
-    echo "  source /tmp/numa_env_\$(whoami).sh  # 加载环境变量"
-    echo ""
-    echo "${GREEN}启动训练示例:${NC}"
+    echo "${GREEN}推荐启动命令:${NC}"
     echo "  numactl $bind_args python train.py"
     echo ""
 
-    # 保存到临时文件供 source
-    local env_file="/tmp/numa_env_$(whoami 2>/dev/null || echo "default").sh"
+    # GPU -> NUMA 映射详情
+    if [[ ${#gpu_numa_nodes[@]} -gt 0 ]]; then
+        echo "${GREEN}GPU -> NUMA 映射:${NC}"
+        for mapping in "${gpu_numa_nodes[@]}"; do
+            echo "  GPU $mapping"
+        done
+        echo ""
+    fi
+
+    # 保存到临时文件
+    local env_file="/tmp/numa_env_$(whoami 2>/dev/null || echo 'default').sh"
     cat > "$env_file" << EOF
 # NUMA Auto-Bind 环境变量
 # 生成时间: $(date)
@@ -331,15 +580,6 @@ generate_bind_command() {
 export NUMA_CPUS="$target_cpus"
 export NUMA_NODE="$target_node"
 export NUMA_GPUS="$gpu_ids"
-
-# GPU -> NUMA 映射详情
-EOF
-
-    for mapping in "${gpu_numa_nodes[@]:-}"; do
-        echo "# $mapping" >> "$env_file"
-    done
-
-    cat >> "$env_file" << EOF
 
 # 推荐启动命令
 export LAUNCH_CMD="numactl $bind_args"
@@ -352,31 +592,40 @@ EOF
     log_info "环境变量已保存到: $env_file"
     echo ""
 
-    # 直接生成可直接使用的脚本
-    local wrapper_script="/tmp/numa_launch_\$(whoami 2>/dev/null || echo "default").sh"
-    cat > "$wrapper_script" << EOF
+    # 生成可直接使用的包装脚本
+    local wrapper="/tmp/numa_launch_$(whoami 2>/dev/null || echo 'default').sh"
+    cat > "$wrapper" << EOF
 #!/bin/bash
 # NUMA Auto-Bind 启动包装脚本
-# 使用: numa_launch.sh <your_command>
-# 例: numa_launch.sh python train.py --args ...
+# 使用: $wrapper <command> [args...]
+#
+# NUMA 绑定: node=$node_display, cpus=$target_cpus
 
 source "$env_file"
 
 if [[ \$# -eq 0 ]]; then
     echo "用法: \$0 <command> [args...]"
-    echo "例: \$0 python train.py"
+    echo "例: \$0 python train.py --config config.yaml"
+    echo ""
+    echo "当前绑定: NUMA node=$node_display, CPU=$target_cpus"
     exit 1
 fi
 
-echo "启动命令 (NUMA 绑定: node=$target_node, cpus=$target_cpus):"
-echo "  \$@"
+echo "==> NUMA 绑核启动"
+echo "    节点: $node_display"
+echo "    CPU:  $target_cpus"
+echo "    命令: \$@"
 echo ""
 
 exec numactl $bind_args "\$@"
 EOF
 
-    chmod +x "$wrapper_script" 2>/dev/null || true
-    log_info "启动包装脚本: $wrapper_script"
+    chmod +x "$wrapper" 2>/dev/null || true
+    log_info "启动包装脚本: $wrapper"
+    echo ""
+    echo "用法示例:"
+    echo "  source $env_file"
+    echo "  $wrapper python train.py"
     echo ""
 }
 
@@ -407,6 +656,10 @@ parse_args() {
                 MODE="show"
                 shift
                 ;;
+            --force|-f)
+                FORCE=1
+                shift
+                ;;
             --verbose|-v)
                 VERBOSE=1
                 shift
@@ -432,6 +685,7 @@ parse_args() {
 
     if [[ -z "$MODE" ]]; then
         log_err "请指定运行模式 (--gpus, --mode, 或 --show)"
+        echo ""
         usage
     fi
 
@@ -444,6 +698,11 @@ parse_args() {
         log_err "--gpus 需要指定 GPU ID 列表"
         exit 1
     fi
+
+    if [[ "$MODE" == "gpu" ]] && [[ ! "$GPU_IDS" =~ ^[0-9,\ ]+$ ]]; then
+        log_err "--gpus 参数格式错误，请使用逗号分隔的数字，如: 0,1,2,3"
+        exit 1
+    fi
 }
 
 #==============================================================================
@@ -452,18 +711,21 @@ parse_args() {
 main() {
     parse_args "$@"
 
-    # 检查是否为 Linux
-    if [[ "$(uname)" != "Linux" ]]; then
-        log_warn "此脚本设计用于 Linux 系统，当前运行在 $(uname)，部分功能可能受限"
+    # Linux 检查
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        if [[ "$FORCE" != "1" && "$MODE" != "show" ]]; then
+            log_warn "NUMA 是 Linux 特性，当前系统: $(uname -s)"
+            log_info "使用 --force 可强制运行（可能无法获取完整信息）"
+        fi
     fi
+
+    check_dependencies
 
     case "$MODE" in
         show)
-            check_dependencies
             show_numa_topology
             ;;
         full|strict|gpu|manual)
-            check_dependencies
             show_numa_topology
             generate_bind_command "$MODE" "$GPU_IDS" "$MANUAL_CPUS" "$MANUAL_NODE"
             ;;
